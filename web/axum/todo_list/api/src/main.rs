@@ -1,165 +1,109 @@
-//! Provides a RESTful web server managing some Todos.
-//!
-//! API will be:
-//!
-//! - `GET /todos`: return a JSON list of Todos.
-//! - `POST /todos`: create a new Todo.
-//! - `PATCH /todos/:id`: update a specific Todo.
-//! - `DELETE /todos/:id`: delete a specific Todo.
-//!
-//! Run with
-//!
-//! ```not_rust
-//! cargo run -p example-todos
-//! ```
-
+use tokio::net::TcpListener;
 use axum::{
-    error_handling::HandleErrorLayer,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, patch},
-    Json, Router,
+    routing::{get, get_service, post, delete, put, patch},
+    Json,
+    Router,
+    middleware,
+    response::{Response},
+    response::{Html, IntoResponse},
+    extract::{Query, Path, State}
 };
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
-use tower::{BoxError, ServiceBuilder};
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
+use serde::{Serialize, Deserialize};
+use serde_json::{json, Value};
+use tower_cookies::{Cookie, Cookies, CookieManagerLayer};
+use tower_http::services::ServeDir;
+
+mod model;
+mod error;
+use crate::model::{ModelController, Todo, TodoCreate};
+pub use self::error::{Error, Result};
+
+#[derive(Debug, Deserialize)]
+struct TodoPayload {
+    id: u64,
+    name: String,
+    completed: bool
+}
 
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "example_todos=debug,tower_http=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+async fn main() -> Result<()> {
+    let mc = ModelController::new().await?;
 
-    let db = Db::default();
+    let routes_api = routes(mc.clone());
 
-    // Compose the routes
     let app = Router::new()
-        .route("/todos", get(todos_index).post(todos_create))
-        .route("/todos/:id", patch(todos_update).delete(todos_delete))
-        // Add middleware to all routes
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(|error: BoxError| async move {
-                    if error.is::<tower::timeout::error::Elapsed>() {
-                        Ok(StatusCode::REQUEST_TIMEOUT)
-                    } else {
-                        Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Unhandled internal error: {error}"),
-                        ))
-                    }
-                }))
-                .timeout(Duration::from_secs(10))
-                .layer(TraceLayer::new_for_http())
-                .into_inner(),
-        )
-        .with_state(db);
+        .route("/", get(hello_handler))
+        .route("/json", get(json_handler))
+        .route("/todos", post(todo_handler))
+        .nest("/api", routes_api);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:3001").await.unwrap();
+        println!("App running on {:?}", listener.local_addr());
+        axum::serve(listener, app).await.unwrap();
+
+        Ok(())
 }
 
-// The query parameters for todos index
-#[derive(Debug, Deserialize, Default)]
-pub struct Pagination {
-    pub offset: Option<usize>,
-    pub limit: Option<usize>,
+async fn hello_handler () -> &'static str {
+    "Hello"
 }
 
-async fn todos_index(
-    pagination: Option<Query<Pagination>>,
-    State(db): State<Db>,
-) -> impl IntoResponse {
-    let todos = db.read().unwrap();
+async fn json_handler () -> Json<Value> {
+    let body = Json(json!({
+        "result": {
+            "success": true
+        }
+    }));
 
-    let Query(pagination) = pagination.unwrap_or_default();
-
-    let todos = todos
-        .values()
-        .skip(pagination.offset.unwrap_or(0))
-        .take(pagination.limit.unwrap_or(usize::MAX))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    Json(todos)
+    body
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateTodo {
-    text: String,
+async fn todo_handler(payload: Json<TodoPayload>) -> Json<Value> {
+    let body = Json(json!({
+        "todo": {
+            "id": payload.id,
+            "name": payload.name,
+            "completed": payload.completed
+        }
+    }));
+    body
 }
 
-async fn todos_create(State(db): State<Db>, Json(input): Json<CreateTodo>) -> impl IntoResponse {
-    let todo = Todo {
-        id: Uuid::new_v4(),
-        text: input.text,
-        completed: false,
-    };
+async fn create_todo (
+    State(mc): State<ModelController>,
+    Json(todo_create): Json<TodoCreate>
+) -> Result<Json<Todo>> {
+    println!("create todo");
 
-    db.write().unwrap().insert(todo.id, todo.clone());
-
-    (StatusCode::CREATED, Json(todo))
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateTodo {
-    text: Option<String>,
-    completed: Option<bool>,
-}
-
-async fn todos_update(
-    Path(id): Path<Uuid>,
-    State(db): State<Db>,
-    Json(input): Json<UpdateTodo>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let mut todo = db
-        .read()
-        .unwrap()
-        .get(&id)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    if let Some(text) = input.text {
-        todo.text = text;
-    }
-
-    if let Some(completed) = input.completed {
-        todo.completed = completed;
-    }
-
-    db.write().unwrap().insert(todo.id, todo.clone());
+    let todo = mc.create_todo(todo_create).await?;
 
     Ok(Json(todo))
 }
 
-async fn todos_delete(Path(id): Path<Uuid>, State(db): State<Db>) -> impl IntoResponse {
-    if db.write().unwrap().remove(&id).is_some() {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    }
+async fn todos_list (
+    State(mc): State<ModelController>,
+) -> Result<Json<Vec<Todo>>> {
+    println!("todo_list");
+
+    let todos =  mc.get_todos().await?;
+
+    Ok(Json(todos))
 }
 
-type Db = Arc<RwLock<HashMap<Uuid, Todo>>>;
+async fn delete_todo(
+    State(mc): State<ModelController>,
+    Path(id): Path<u64>
+ ) -> Result<Json<Todo>> {
+    println!("delete_todo");
 
-#[derive(Debug, Serialize, Clone)]
-struct Todo {
-    id: Uuid,
-    text: String,
-    completed: bool,
+    let todo = mc.delete_todo(id as u64).await?;
+
+    Ok(Json(todo))
+}
+
+pub fn routes(mc: ModelController) -> Router {
+    Router::new()
+        .route("/todos", post(create_todo).get(todos_list))
+        .route("/todos/:id", delete(delete_todo))
+        .with_state(mc)
 }
